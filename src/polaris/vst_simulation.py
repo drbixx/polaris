@@ -178,6 +178,30 @@ def _load_header_template(
 def _get_detector_sections(
     header: pyfits.Header | None, fallback_shape: tuple[int, int]
 ) -> dict[str, int | slice]:
+    def _infer_output_low_side(axis: str, active_size: int) -> bool:
+        if header is None:
+            return True
+
+        out_key = f"ESO DET OUT1 {axis}"
+        out_coord = header.get(out_key)
+        if out_coord is None:
+            return True
+        out_coord = int(out_coord)
+
+        chip_key = f"ESO DET CHIP {axis}"
+        chip_index = header.get(chip_key)
+        if chip_index is not None and active_size > 0:
+            chip_index = int(chip_index)
+            chip_start = (chip_index - 1) * active_size + 1
+            chip_end = chip_index * active_size
+            return abs(out_coord - chip_start) <= abs(out_coord - chip_end)
+
+        if active_size > 0:
+            out_local = ((out_coord - 1) % active_size) + 1
+            return out_local <= (active_size + 1) // 2
+
+        return True
+
     if header is None:
         nx, ny = fallback_shape
         prscx, prscy, ovscx, ovscy = 0, 0, 0, 0
@@ -199,6 +223,26 @@ def _get_detector_sections(
 
     total_x = prscx + nx + ovscx
     total_y = prscy + ny + ovscy
+    x_output_low = _infer_output_low_side("X", nx)
+    y_output_low = _infer_output_low_side("Y", ny)
+
+    if x_output_low:
+        prex_x = slice(0, prscx)
+        active_x = slice(prscx, prscx + nx)
+        ovx_x = slice(active_x.stop, active_x.stop + ovscx)
+    else:
+        ovx_x = slice(0, ovscx)
+        active_x = slice(ovscx, ovscx + nx)
+        prex_x = slice(active_x.stop, active_x.stop + prscx)
+
+    if y_output_low:
+        prey_y = slice(0, prscy)
+        active_y = slice(prscy, prscy + ny)
+        ovy_y = slice(active_y.stop, active_y.stop + ovscy)
+    else:
+        ovy_y = slice(0, ovscy)
+        active_y = slice(ovscy, ovscy + ny)
+        prey_y = slice(active_y.stop, active_y.stop + prscy)
     return {
         "nx": nx,
         "ny": ny,
@@ -208,13 +252,19 @@ def _get_detector_sections(
         "ovscy": ovscy,
         "total_x": total_x,
         "total_y": total_y,
-        "active_x": slice(prscx, prscx + nx),
-        "active_y": slice(prscy, prscy + ny),
+        "x_output_low": x_output_low,
+        "y_output_low": y_output_low,
+        "active_x": active_x,
+        "active_y": active_y,
+        "prex_x": prex_x,
+        "ovx_x": ovx_x,
+        "prey_y": prey_y,
+        "ovy_y": ovy_y,
     }
 
 
 @lru_cache(maxsize=2)
-def _load_bias_levels(path: str) -> dict[str, float]:
+def _load_bias_levels(path: str) -> dict[str, dict[str, float]]:
     ref_path = Path(path)
     if not ref_path.exists():
         logger.warning("bias template not found: %s", ref_path)
@@ -229,23 +279,45 @@ def _load_bias_levels(path: str) -> dict[str, float]:
             fallback = (data.shape[1], data.shape[0])
             sections = _get_detector_sections(hdu.header, fallback)
             ysec = sections["active_y"]
-            regions = []
-            prscx = sections["prscx"]
-            if prscx > 0:
-                regions.append(data[ysec, :prscx])
-            ovscx = sections["ovscx"]
-            x_end = sections["active_x"].stop
-            if ovscx > 0:
-                regions.append(data[ysec, x_end : x_end + ovscx])
-            if not regions:
+
+            prex = None
+            if sections["prscx"] > 0:
+                prex = float(np.median(data[ysec, sections["prex_x"]]))
+
+            ovx = None
+            if sections["ovscx"] > 0:
+                ovx = float(np.median(data[ysec, sections["ovx_x"]]))
+
+            prey = None
+            if sections["prscy"] > 0:
+                prey = float(np.median(data[sections["prey_y"], :]))
+
+            ovy = None
+            if sections["ovscy"] > 0:
+                ovy = float(np.median(data[sections["ovy_y"], :]))
+
+            scan_values = [
+                value for value in (prex, ovx, prey, ovy) if value is not None
+            ]
+            if not scan_values:
                 continue
-            values = np.concatenate(
-                [region.ravel() for region in regions if region.size > 0]
-            )
-            if values.size == 0:
-                continue
+
+            default_bias = float(np.median(scan_values))
+            active_bias_candidates = [
+                value for value in (prex, ovx) if value is not None
+            ]
+            if active_bias_candidates:
+                active_bias = float(np.median(active_bias_candidates))
+            else:
+                active_bias = default_bias
             extname = hdu.header.get("EXTNAME", f"EXT{idx}")
-            levels[extname] = float(np.median(values))
+            levels[extname] = {
+                "active": active_bias,
+                "prex": prex if prex is not None else default_bias,
+                "ovx": ovx if ovx is not None else default_bias,
+                "prey": prey if prey is not None else default_bias,
+                "ovy": ovy if ovy is not None else default_bias,
+            }
 
     return levels
 
@@ -487,11 +559,23 @@ class Mosaic:
         template_primary = None
         template_images = ()
         primary_header_size = None
-        bias_levels = _load_bias_levels(str(DEFAULT_OMEGACAM_BIAS_TEMPLATE))
-        if bias_levels:
-            default_bias = float(np.median(list(bias_levels.values())))
+        bias_profiles = _load_bias_levels(str(DEFAULT_OMEGACAM_BIAS_TEMPLATE))
+        if bias_profiles:
+            keys = ("active", "prex", "ovx", "prey", "ovy")
+            default_profile = {
+                key: float(
+                    np.median([profile[key] for profile in bias_profiles.values()])
+                )
+                for key in keys
+            }
         else:
-            default_bias = 0.0
+            default_profile = {
+                "active": 0.0,
+                "prex": 0.0,
+                "ovx": 0.0,
+                "prey": 0.0,
+                "ovy": 0.0,
+            }
         if header_template:
             template_primary, template_images = _load_header_template(
                 str(header_template)
@@ -567,7 +651,7 @@ class Mosaic:
                 wcs = create_wcs(chip_center, self.ccd)
             sections = _get_detector_sections(template_header, self.ccd.shape)
             active_shape = (sections["nx"], sections["ny"])
-            origin = (sections["prscx"], sections["prscy"])
+            origin = (sections["active_x"].start, sections["active_y"].start)
             active_image = self.ccd.run(
                 table, wcs, starsim.beta, shift=shift, shape=active_shape, origin=origin
             )
@@ -588,15 +672,40 @@ class Mosaic:
                 if template_header is not None
                 else f"EXT{i + 1}"
             )
-            bias_level = bias_levels.get(extname, default_bias)
+            profile = bias_profiles.get(extname, default_profile)
+            active_bias = profile["active"]
             image = rng.normal(
-                loc=bias_level,
+                loc=active_bias,
                 scale=self.ccd.ron,
                 size=(sections["total_y"], sections["total_x"]),
             )
             image[sections["active_y"], sections["active_x"]] = (
-                bias_level + active_image
+                active_bias + active_image
             )
+            if sections["prscx"] > 0:
+                image[sections["active_y"], sections["prex_x"]] = rng.normal(
+                    loc=profile["prex"],
+                    scale=self.ccd.ron,
+                    size=(sections["ny"], sections["prscx"]),
+                )
+            if sections["ovscx"] > 0:
+                image[sections["active_y"], sections["ovx_x"]] = rng.normal(
+                    loc=profile["ovx"],
+                    scale=self.ccd.ron,
+                    size=(sections["ny"], sections["ovscx"]),
+                )
+            if sections["prscy"] > 0:
+                image[sections["prey_y"], :] = rng.normal(
+                    loc=profile["prey"],
+                    scale=self.ccd.ron,
+                    size=(sections["prscy"], sections["total_x"]),
+                )
+            if sections["ovscy"] > 0:
+                image[sections["ovy_y"], :] = rng.normal(
+                    loc=profile["ovy"],
+                    scale=self.ccd.ron,
+                    size=(sections["ovscy"], sections["total_x"]),
+                )
             image = np.clip(np.rint(image), 0, np.iinfo(np.uint16).max).astype(
                 np.uint16
             )
