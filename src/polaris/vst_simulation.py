@@ -41,6 +41,9 @@ MATRIX = {
 DEFAULT_OMEGACAM_HEADER_TEMPLATE = (
     Path(__file__).resolve().parents[2] / "OMEGACAM-master.txt"
 )
+DEFAULT_OMEGACAM_BIAS_TEMPLATE = (
+    Path(__file__).resolve().parents[2] / "OMEGACAM.2018-02-19T05:32:25.059.fits"
+)
 PRIMARY_HEADER_SKIP = {"SIMPLE", "NAXIS", "EXTEND", "CHECKSUM", "DATASUM"}
 IMAGE_HEADER_SKIP = {
     "XTENSION",
@@ -172,6 +175,81 @@ def _load_header_template(
     return primary_header, image_headers
 
 
+def _get_detector_sections(
+    header: pyfits.Header | None, fallback_shape: tuple[int, int]
+) -> dict[str, int | slice]:
+    if header is None:
+        nx, ny = fallback_shape
+        prscx, prscy, ovscx, ovscy = 0, 0, 0, 0
+    else:
+        nx = int(
+            header.get(
+                "ESO DET OUT1 NX", header.get("ESO DET CHIP NX", fallback_shape[0])
+            )
+        )
+        ny = int(
+            header.get(
+                "ESO DET OUT1 NY", header.get("ESO DET CHIP NY", fallback_shape[1])
+            )
+        )
+        prscx = int(header.get("ESO DET OUT1 PRSCX", 0))
+        prscy = int(header.get("ESO DET OUT1 PRSCY", 0))
+        ovscx = int(header.get("ESO DET OUT1 OVSCX", 0))
+        ovscy = int(header.get("ESO DET OUT1 OVSCY", 0))
+
+    total_x = prscx + nx + ovscx
+    total_y = prscy + ny + ovscy
+    return {
+        "nx": nx,
+        "ny": ny,
+        "prscx": prscx,
+        "prscy": prscy,
+        "ovscx": ovscx,
+        "ovscy": ovscy,
+        "total_x": total_x,
+        "total_y": total_y,
+        "active_x": slice(prscx, prscx + nx),
+        "active_y": slice(prscy, prscy + ny),
+    }
+
+
+@lru_cache(maxsize=2)
+def _load_bias_levels(path: str) -> dict[str, float]:
+    ref_path = Path(path)
+    if not ref_path.exists():
+        logger.warning("bias template not found: %s", ref_path)
+        return {}
+
+    levels = {}
+    with pyfits.open(ref_path, memmap=False) as hdul:
+        for idx, hdu in enumerate(hdul[1:], start=1):
+            if not isinstance(hdu, pyfits.ImageHDU) or hdu.data is None:
+                continue
+            data = np.asarray(hdu.data, dtype=np.float64)
+            fallback = (data.shape[1], data.shape[0])
+            sections = _get_detector_sections(hdu.header, fallback)
+            ysec = sections["active_y"]
+            regions = []
+            prscx = sections["prscx"]
+            if prscx > 0:
+                regions.append(data[ysec, :prscx])
+            ovscx = sections["ovscx"]
+            x_end = sections["active_x"].stop
+            if ovscx > 0:
+                regions.append(data[ysec, x_end : x_end + ovscx])
+            if not regions:
+                continue
+            values = np.concatenate(
+                [region.ravel() for region in regions if region.size > 0]
+            )
+            if values.size == 0:
+                continue
+            extname = hdu.header.get("EXTNAME", f"EXT{idx}")
+            levels[extname] = float(np.median(values))
+
+    return levels
+
+
 def mod_vector(angle: float):
     """Return a module vector for a specific angle"""
 
@@ -185,22 +263,34 @@ class CCDImage:
         self.pixelsize = pixelsize * units.arcsec
         self.ron = ron
 
-    def run(self, table: Table, wcs: WCS, beta: float = 3.5, shift=None):
+    def run(
+        self,
+        table: Table,
+        wcs: WCS,
+        beta: float = 3.5,
+        shift=None,
+        shape: tuple[int, int] | None = None,
+        origin: tuple[float, float] = (0.0, 0.0),
+    ):
         """Simulate a single CCD with a given WCS for stars given in `table`"""
+        if shape is None:
+            shape = self.shape
 
         coords = SkyCoord(table["ra"], table["dec"], unit="degree")
         xcoords, ycoords = coords.to_pixel(wcs)
         if shift:
             xcoords += shift["x"]
             ycoords += shift["y"]
+        xcoords -= origin[0]
+        ycoords -= origin[1]
 
         table["x_0"] = xcoords
         table["y_0"] = ycoords
-        sel = (xcoords > 0) & (xcoords < self.shape[0])
-        sel &= (ycoords > 0) & (ycoords < self.shape[1])
+        sel = (xcoords > 0) & (xcoords < shape[0])
+        sel &= (ycoords > 0) & (ycoords < shape[1])
         seltable = table[sel]
         psf_model = MoffatPSF(bbox_factor=150.0 / beta)
-        image = make_model_image(tuple(self.shape[::-1]), psf_model, seltable)
+        image = make_model_image(tuple(shape[::-1]), psf_model, seltable)
 
         return image
 
@@ -397,6 +487,11 @@ class Mosaic:
         template_primary = None
         template_images = ()
         primary_header_size = None
+        bias_levels = _load_bias_levels(str(DEFAULT_OMEGACAM_BIAS_TEMPLATE))
+        if bias_levels:
+            default_bias = float(np.median(list(bias_levels.values())))
+        else:
+            default_bias = 0.0
         if header_template:
             template_primary, template_images = _load_header_template(
                 str(header_template)
@@ -470,15 +565,38 @@ class Mosaic:
             else:
                 _, chip_center = ordered_centers[i]
                 wcs = create_wcs(chip_center, self.ccd)
-            image = self.ccd.run(table, wcs, starsim.beta, shift=shift)
+            sections = _get_detector_sections(template_header, self.ccd.shape)
+            active_shape = (sections["nx"], sections["ny"])
+            origin = (sections["prscx"], sections["prscy"])
+            active_image = self.ccd.run(
+                table, wcs, starsim.beta, shift=shift, shape=active_shape, origin=origin
+            )
             if polstars:
                 # Add polarised stars
-                image = image + self.ccd.run(polstars, wcs, starsim.beta)
-            image = image + skylevel * t_exp
+                active_image = active_image + self.ccd.run(
+                    polstars, wcs, starsim.beta, shape=active_shape, origin=origin
+                )
+            active_image = active_image + skylevel * t_exp
             if poisson_noise:
-                image = apply_poisson_noise(image, seed=rng)
+                active_image = apply_poisson_noise(active_image, seed=rng)
             # Add read-out noise
-            image = image + rng.normal(0.0, self.ccd.ron, size=image.shape)
+            active_image = active_image + rng.normal(
+                0.0, self.ccd.ron, size=active_image.shape
+            )
+            extname = (
+                template_header.get("EXTNAME", f"EXT{i + 1}")
+                if template_header is not None
+                else f"EXT{i + 1}"
+            )
+            bias_level = bias_levels.get(extname, default_bias)
+            image = rng.normal(
+                loc=bias_level,
+                scale=self.ccd.ron,
+                size=(sections["total_y"], sections["total_x"]),
+            )
+            image[sections["active_y"], sections["active_x"]] = (
+                bias_level + active_image
+            )
             image = np.clip(np.rint(image), 0, np.iinfo(np.uint16).max).astype(
                 np.uint16
             )
