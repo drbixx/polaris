@@ -15,11 +15,12 @@ from functools import lru_cache
 import logging
 from pathlib import Path
 import tomllib
+from astropy import units
 
 from astropy.coordinates import SkyCoord
 import astropy.io.fits as pyfits
 from astropy.table import Table, vstack
-from astropy import units
+from astropy.time import Time
 from astropy.wcs import WCS
 import duckdb
 import numpy as np
@@ -139,6 +140,97 @@ def _to_utc_timestamp(timestamp: datetime | None) -> datetime:
 
 def _format_iso_millis(timestamp: datetime | None) -> str:
     return _to_utc_timestamp(timestamp).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+
+
+def _seconds_since_midnight(timestamp: datetime | None) -> float:
+    ts = _to_utc_timestamp(timestamp)
+    return ts.hour * 3600 + ts.minute * 60 + ts.second + ts.microsecond / 1_000_000
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return _to_utc_timestamp(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _template_utc_offset_seconds(template_header: pyfits.Header | None) -> float:
+    if template_header is None:
+        return 0.0
+    date_obs = _parse_iso_timestamp(template_header.get("DATE-OBS"))
+    utc_value = template_header.get("UTC")
+    if date_obs is None or utc_value is None:
+        return 0.0
+    try:
+        utc_seconds = float(utc_value)
+    except (TypeError, ValueError):
+        return 0.0
+    offset = utc_seconds - _seconds_since_midnight(date_obs)
+    return ((offset + 43200.0) % 86400.0) - 43200.0
+
+
+def _derive_time_headers(
+    date_obs: datetime | None,
+    geolon_deg: float | None,
+    utc_offset_seconds: float,
+) -> dict[str, float]:
+    date_obs_ts = _to_utc_timestamp(date_obs)
+    mjd_obs = Time(date_obs_ts, scale="utc").mjd
+    utc_seconds = (_seconds_since_midnight(date_obs_ts) + utc_offset_seconds) % 86400.0
+
+    if geolon_deg is None:
+        lst_seconds = utc_seconds
+    else:
+        utc_ts = date_obs_ts + timedelta(seconds=utc_offset_seconds)
+        lst = Time(utc_ts, scale="utc").sidereal_time(
+            "apparent", longitude=geolon_deg * units.deg
+        )
+        lst_seconds = (lst.hour * 3600.0) % 86400.0
+
+    return {
+        "MJD-OBS": round(mjd_obs, 7),
+        "UTC": round(utc_seconds, 3),
+        "LST": round(lst_seconds, 3),
+    }
+
+
+def _format_seconds_label(seconds: float) -> str:
+    total_ms = int(round((seconds % 86400.0) * 1000)) % (86400 * 1000)
+    hours, rem = divmod(total_ms, 3600 * 1000)
+    minutes, rem = divmod(rem, 60 * 1000)
+    return f"{hours:02d}:{minutes:02d}:{rem / 1000.0:06.3f}"
+
+
+def _format_compact_count(value: int | float | None) -> str:
+    if value is None:
+        return "0"
+    value = int(value)
+    if value >= 1_000_000 and value % 1_000_000 == 0:
+        return f"{value // 1_000_000}M"
+    if value >= 1_000 and value % 1_000 == 0:
+        return f"{value // 1_000}K"
+    return str(value)
+
+
+def _build_simulated_exposure_names(params: dict) -> tuple[str, str]:
+    seed_value = params.get("random_seed", params.get("seed"))
+    if seed_value is None or int(seed_value) < 0:
+        seed_token = "RND"
+    else:
+        seed_token = str(int(seed_value))
+
+    nstars_token = _format_compact_count(params.get("nstars"))
+    pol_nstars_token = _format_compact_count(
+        params.get("polarisation", {}).get("nstars", 0)
+    )
+    t_exp = float(params.get("t_exp", 0.0))
+    t_exp_token = f"{t_exp:g}"
+
+    object_name = f"SIM_{seed_token}_{nstars_token}_{pol_nstars_token}"
+    obs_name = f"SIM_OCAM_{seed_token}_{nstars_token}_{pol_nstars_token}_T{t_exp_token}"
+    return object_name, obs_name
 
 
 @lru_cache(maxsize=4)
@@ -554,6 +646,8 @@ class Mosaic:
         polstars=None,
         poisson_noise: bool = True,
         shift: dict[int, float] | None = None,
+        object_name: str | None = None,
+        obs_name: str | None = None,
         obs_start: datetime | None = None,
         tpl_start: datetime | None = None,
         date_obs: datetime | None = None,
@@ -587,6 +681,8 @@ class Mosaic:
         template_primary = None
         template_images = ()
         primary_header_size = None
+        utc_offset_seconds = 0.0
+        geolon_deg = None
         bias_profiles = _load_bias_levels(str(DEFAULT_OMEGACAM_BIAS_TEMPLATE))
         if bias_profiles:
             keys = ("active", "prex", "ovx", "prey", "ovy")
@@ -612,6 +708,22 @@ class Mosaic:
                 primary_header_size = len(
                     template_primary.tostring(endcard=True, padding=True)
                 )
+                utc_offset_seconds = _template_utc_offset_seconds(template_primary)
+                geolon_value = template_primary.get(
+                    "ESO TEL GEOLON",
+                    template_primary.get("HIERARCH ESO TEL GEOLON"),
+                )
+                if geolon_value is not None:
+                    try:
+                        geolon_deg = float(geolon_value)
+                    except (TypeError, ValueError):
+                        geolon_deg = None
+
+        time_headers = _derive_time_headers(
+            date_obs=date_obs_ts,
+            geolon_deg=geolon_deg,
+            utc_offset_seconds=utc_offset_seconds,
+        )
 
         common_cards = [
             ("magzp", zeropoint, ""),
@@ -660,9 +772,27 @@ class Mosaic:
             hdus[0].header["RA"] = field_ra
         if "DEC" in hdus[0].header:
             hdus[0].header["DEC"] = field_dec
+        if object_name is not None:
+            hdus[0].header["OBJECT"] = object_name
+        if obs_name is not None:
+            hdus[0].header["HIERARCH ESO OBS NAME"] = obs_name
+        hdus[0].header["HIERARCH ESO INS FILT1 ID"] = "VP1"
+        hdus[0].header["HIERARCH ESO INS FILT1 NAME"] = "VSTPOL"
         hdus[0].header.extend(primary_cards)
         hdus[0].header["DATE"] = date_str
         hdus[0].header["DATE-OBS"] = date_obs_str
+        hdus[0].header["MJD-OBS"] = (
+            time_headers["MJD-OBS"],
+            f"MJD start ({date_obs_str})",
+        )
+        hdus[0].header["UTC"] = (
+            time_headers["UTC"],
+            f"{_format_seconds_label(time_headers['UTC'])} UTC at start (sec)",
+        )
+        hdus[0].header["LST"] = (
+            time_headers["LST"],
+            f"{_format_seconds_label(time_headers['LST'])} LST at start (sec)",
+        )
         hdus[0].header["HIERARCH ESO OBS START"] = obs_start_str
         hdus[0].header["HIERARCH ESO TPL START"] = tpl_start_str
         if primary_header_size is not None:
@@ -857,6 +987,7 @@ def run(params):
         zeropoint=params["zeropoint"],
         rng=rng,
     )
+    object_name, obs_name = _build_simulated_exposure_names(params)
 
     if "polarisation" in params:
         stokes = add_polarization(mosaic, center, stars, params, starsim, rng=rng)
@@ -903,6 +1034,8 @@ def run(params):
                 polstars=polstars,
                 poisson_noise=params["poisson_noise"],
                 shift=shift,
+                object_name=object_name,
+                obs_name=obs_name,
                 obs_start=obs_start,
                 tpl_start=tpl_start,
                 date_obs=date_obs,
@@ -918,6 +1051,8 @@ def run(params):
             t_exp=params["t_exp"],
             stars=stars,
             skylevel=params["skylevel"],
+            object_name=object_name,
+            obs_name=obs_name,
             obs_start=obs_start,
             tpl_start=obs_start,
             date_obs=obs_start,
