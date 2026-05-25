@@ -10,6 +10,7 @@ ds9 -tile grid layout 3 4 'polaris.fits[3]' 'polaris.fits[2]' 'polaris.fits[1]' 
 """
 
 from argparse import ArgumentParser
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 import logging
 from pathlib import Path
@@ -126,6 +127,18 @@ def _pad_header_to_size(target: pyfits.Header, size: int):
         return
     while len(target.tostring(endcard=True, padding=True)) < size:
         target.append(pyfits.Card.fromstring(" " * 80), end=True)
+
+
+def _to_utc_timestamp(timestamp: datetime | None) -> datetime:
+    if timestamp is None:
+        return datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
+def _format_iso_millis(timestamp: datetime | None) -> str:
+    return _to_utc_timestamp(timestamp).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
 
 
 @lru_cache(maxsize=4)
@@ -541,6 +554,9 @@ class Mosaic:
         polstars=None,
         poisson_noise: bool = True,
         shift: dict[int, float] | None = None,
+        obs_start: datetime | None = None,
+        tpl_start: datetime | None = None,
+        date_obs: datetime | None = None,
         rng=None,
     ):
         if isinstance(stars, int):
@@ -551,6 +567,18 @@ class Mosaic:
             table = stars
         field_ra = center.ra.degree
         field_dec = center.dec.degree
+        date_obs_ts = _to_utc_timestamp(date_obs)
+        obs_start_ts = _to_utc_timestamp(
+            obs_start if obs_start is not None else date_obs_ts
+        )
+        tpl_start_ts = _to_utc_timestamp(
+            tpl_start if tpl_start is not None else obs_start_ts
+        )
+        date_ts = date_obs_ts + timedelta(seconds=t_exp)
+        date_str = _format_iso_millis(date_ts)
+        date_obs_str = _format_iso_millis(date_obs_ts)
+        obs_start_str = _format_iso_millis(obs_start_ts)
+        tpl_start_str = _format_iso_millis(tpl_start_ts)
 
         centers = self._calc_centers(center)
         ordered_centers = sorted(
@@ -633,6 +661,10 @@ class Mosaic:
         if "DEC" in hdus[0].header:
             hdus[0].header["DEC"] = field_dec
         hdus[0].header.extend(primary_cards)
+        hdus[0].header["DATE"] = date_str
+        hdus[0].header["DATE-OBS"] = date_obs_str
+        hdus[0].header["HIERARCH ESO OBS START"] = obs_start_str
+        hdus[0].header["HIERARCH ESO TPL START"] = tpl_start_str
         if primary_header_size is not None:
             _pad_header_to_size(hdus[0].header, primary_header_size)
         for i in range(len(ordered_centers)):
@@ -711,6 +743,7 @@ class Mosaic:
             )
             header = template_header if template_header is not None else wcs.to_header()
             hdu = pyfits.ImageHDU(image, header=header)
+            hdu.header["DATE"] = date_str
             hdu.header.extend(image_cards)
             hdus.append(hdu)
         logger.info("Writing mosaic to file %s", outfile)
@@ -833,6 +866,8 @@ def run(params):
         shifts = params["shifts"]
         angles = polpars["angles"]
         nexp = len(angles)
+        obs_start = datetime.now(timezone.utc)
+        tpl_start = obs_start
         for expno, angle in enumerate(angles, start=1):
             # Allow for shifts in the polarizer frames
             shift = {}
@@ -840,6 +875,7 @@ def run(params):
                 shift["x"] = shifts[f"x_{angle}"]
             if f"y_{angle}" in shifts:
                 shift["y"] = shifts[f"y_{angle}"]
+            date_obs = obs_start + timedelta(seconds=(expno - 1) * params["t_exp"])
             polstars = stokes["I"].copy()
             modvec = mod_vector(angle)
             # modulate the flux for the current angle
@@ -867,17 +903,24 @@ def run(params):
                 polstars=polstars,
                 poisson_noise=params["poisson_noise"],
                 shift=shift,
+                obs_start=obs_start,
+                tpl_start=tpl_start,
+                date_obs=date_obs,
                 rng=rng,
             )
 
     else:
         logger.info("Creating mosaic")
+        obs_start = datetime.now(timezone.utc)
         mosaic.simulate(
             center,
             starsim,
             t_exp=params["t_exp"],
             stars=stars,
             skylevel=params["skylevel"],
+            obs_start=obs_start,
+            tpl_start=obs_start,
+            date_obs=obs_start,
             rng=rng,
         )
 
