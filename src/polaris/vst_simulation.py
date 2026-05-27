@@ -97,6 +97,17 @@ def _is_wcs_header_key(key: str) -> bool:
     return key.startswith(WCS_HEADER_PREFIXES)
 
 
+def _format_assignment_key(key: str) -> str:
+    if key.startswith("HIERARCH "):
+        return key
+    valid_fits_key = len(key) <= 8 and all(
+        char.isupper() or char.isdigit() or char in "-_" for char in key
+    )
+    if valid_fits_key:
+        return key
+    return f"HIERARCH {_normalize_header_key(key)}"
+
+
 def _copy_header_cards(
     target: pyfits.Header,
     template: pyfits.Header | None,
@@ -119,7 +130,8 @@ def _copy_header_cards(
             continue
         if norm in existing:
             continue
-        target[key] = (card.value, card.comment)
+        assignment_key = _format_assignment_key(key)
+        target[assignment_key] = (card.value, card.comment)
         existing.add(norm)
 
 
@@ -1017,7 +1029,7 @@ def run(params):
             ) / 2
 
             logger.info("Creating mosaic for polarization angle %.1f", angle)
-            outfile = f"polaris-deg{angle:.1f}".replace(".", "_") + ".fits"
+            outfile = f"OMEGACAM.{_format_iso_millis(date_obs)}.fits"
 
             # Save the output file, with normal stars and polarized stars
             mosaic.simulate(
@@ -1045,12 +1057,14 @@ def run(params):
     else:
         logger.info("Creating mosaic")
         obs_start = datetime.now(timezone.utc)
+        outfile = f"OMEGACAM.{_format_iso_millis(obs_start)}.fits"
         mosaic.simulate(
             center,
             starsim,
             t_exp=params["t_exp"],
             stars=stars,
             skylevel=params["skylevel"],
+            outfile=outfile,
             object_name=object_name,
             obs_name=obs_name,
             obs_start=obs_start,
